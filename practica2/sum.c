@@ -23,6 +23,7 @@ typedef struct
     int thread_id;
     int num_threads;
     double sum;
+    int count; // Count of numbers processed
 } ThreadData;
 
 // Helper function to convert a string to a double
@@ -66,6 +67,7 @@ double fast_strtod(const char *str, char **endptr) {
 void *method1_worker(void *arg) {
     ThreadData *data = (ThreadData *)arg;
     double local_sum = 0.0;
+    int local_count = 0; // Thread-local count of numbers
     char *ptr;
 
     while (1) {
@@ -78,21 +80,26 @@ void *method1_worker(void *arg) {
         while (data->position < data->file_size && data->mapped_file[data->position] != '\n') {
             data->position++;
         }
-        data->position++;
+        data->position++; // Move past the newline
         pthread_mutex_unlock(data->mutex);
 
         if (ptr < data->mapped_file + data->position) {
             char *end;
             local_sum += fast_strtod(ptr, &end);
+            local_count++; // Increment local count for each valid number
         }
     }
 
-    double *result = malloc(sizeof(double));
-    *result = local_sum;
-    return result;
+    // Actualizar los resultados en la estructura compartida, con sincronización
+    pthread_mutex_lock(data->mutex);
+    data->sum += local_sum;
+    data->count += local_count;
+    pthread_mutex_unlock(data->mutex);
+
+    return NULL;
 }
 
-double method1(const char *filename, int num_threads) {
+double method1(const char *filename, int num_threads, int *total_numbers) {
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
         perror("Error opening file");
@@ -115,26 +122,26 @@ double method1(const char *filename, int num_threads) {
     // Advise the kernel for sequential access
     madvise(mapped_file, file_size, MADV_SEQUENTIAL);
 
-    // // random acces
-    // madvise(mapped_file, file_size, MADV_RANDOM);
-
     pthread_mutex_t mutex;
     pthread_mutex_init(&mutex, NULL);
 
+    // Create shared ThreadData structure
     ThreadData shared_data = {mapped_file, 0, 0, file_size, 0, &mutex, NULL, 0, num_threads, 0.0};
 
     pthread_t threads[num_threads];
-    for (int i = 0; i < num_threads; i++)
-        pthread_create(&threads[i], NULL, method1_worker, &shared_data);
-
-    double total_sum = 0.0;
     for (int i = 0; i < num_threads; i++) {
-        double *local_sum;
-        pthread_join(threads[i], (void **)&local_sum);
-        total_sum += *local_sum;
-        free(local_sum);
+        pthread_create(&threads[i], NULL, method1_worker, &shared_data);
     }
 
+    // Aggregate the results after all threads are done
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    *total_numbers = shared_data.count; // Total count of numbers processed
+    double total_sum = shared_data.sum; // Total sum of all numbers
+
+    // Clean up
     pthread_mutex_destroy(&mutex);
     munmap(mapped_file, file_size);
     close(fd);
@@ -146,6 +153,7 @@ double method1(const char *filename, int num_threads) {
 void *method2_worker(void *arg) {
     ThreadData *data = (ThreadData *)arg;
     double local_sum = 0.0;
+    int local_count = 0; // Thread-local counter for numbers processed
     char *ptr = data->mapped_file + data->start;
     char *end = data->mapped_file + data->end;
 
@@ -153,15 +161,18 @@ void *method2_worker(void *arg) {
         char *num_end;
         local_sum += fast_strtod(ptr, &num_end);
         ptr = num_end;
-        while (ptr < end && (*ptr == '\n' || *ptr == ' ' || *ptr == '\t'))
+        while (ptr < end && (*ptr == '\n' || *ptr == ' ' || *ptr == '\t')) {
+            local_count++; // Count each parsed number
             ptr++;
+        }
     }
 
     data->sum = local_sum;
+    data->count = local_count;
     return NULL;
 }
 
-double method2(const char *filename, int num_threads) {
+double method2(const char *filename, int num_threads, int *total_numbers) {
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
         perror("Error opening file");
@@ -198,6 +209,7 @@ double method2(const char *filename, int num_threads) {
         thread_data[i].mapped_file = mapped_file;
         thread_data[i].start = current_position;
         thread_data[i].sum = 0.0;
+        thread_data[i].count = 0; // Initialize the count for each thread
 
         size_t lines_in_chunk = (i == num_threads - 1) ? (line_count - current_line) : lines_per_thread;
         while (current_position < file_size && lines_in_chunk > 0)
@@ -211,11 +223,13 @@ double method2(const char *filename, int num_threads) {
     }
 
     double total_sum = 0.0;
+    *total_numbers = 0;
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
         total_sum += thread_data[i].sum;
+        *total_numbers += thread_data[i].count; // Sum up the total count of numbers
     }
-
+    
     munmap(mapped_file, file_size);
     close(fd);
 
@@ -226,6 +240,7 @@ double method2(const char *filename, int num_threads) {
 void *method3_worker(void *arg) {
     ThreadData *data = (ThreadData *)arg;
     double local_sum = 0.0;
+    int local_count = 0; // Thread-local counter for numbers processed
     char *ptr = data->mapped_file;
     char *end = data->mapped_file + data->file_size;
     int thread_id = data->thread_id;
@@ -236,6 +251,7 @@ void *method3_worker(void *arg) {
         char *num_end;
         if (line_num % num_threads == thread_id) {
             local_sum += fast_strtod(ptr, &num_end);
+            local_count++; // Increment local count when a number is processed
         } else {
             num_end = ptr;
             while (num_end < end && *num_end != '\n')
@@ -250,11 +266,13 @@ void *method3_worker(void *arg) {
         line_num++;
     }
 
+    // Store the local sum and count in ThreadData
     data->sum = local_sum;
+    data->count = local_count;
     return NULL;
 }
 
-double method3(const char *filename, int num_threads) {
+double method3(const char *filename, int num_threads, int *total_numbers) {
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
         perror("Error opening file");
@@ -285,13 +303,16 @@ double method3(const char *filename, int num_threads) {
         thread_data[i].thread_id = i;
         thread_data[i].num_threads = num_threads;
         thread_data[i].sum = 0.0;
+        thread_data[i].count = 0; // Initialize count for each thread
         pthread_create(&threads[i], NULL, method3_worker, &thread_data[i]);
     }
 
     double total_sum = 0.0;
+    *total_numbers = 0;
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
         total_sum += thread_data[i].sum;
+        *total_numbers += thread_data[i].count; // Accumulate total count of numbers
     }
 
     munmap(mapped_file, file_size);
@@ -304,20 +325,23 @@ double method3(const char *filename, int num_threads) {
 void *method4_worker(void *arg) {
     ThreadData *data = (ThreadData *)arg;
     double local_sum = 0.0;
+    int local_count = 0; // Thread-local counter for numbers processed
     char *ptr = data->mapped_file + data->start;
     char *end = data->mapped_file + data->end;
 
     while (ptr < end) {
         char *num_end;
         local_sum += fast_strtod(ptr, &num_end);
+        local_count++; // Increment local count when a number is processed
         ptr = num_end + 1;
     }
 
     data->sum = local_sum;
+    data->count = local_count;
     return NULL;
 }
 
-double method4(const char *filename, int num_threads) {
+double method4(const char *filename, int num_threads, int *total_numbers) {
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
         perror("Error opening file");
@@ -350,6 +374,7 @@ double method4(const char *filename, int num_threads) {
         thread_data[i].mapped_file = mapped_file;
         thread_data[i].start = i * chunk_size;
         thread_data[i].end = (i == num_threads - 1) ? file_size : (i + 1) * chunk_size;
+        thread_data[i].count = 0; // Initialize count for each thread
 
         if (i > 0) {
             char *new_start = memchr(mapped_file + thread_data[i].start, '\n', file_size - thread_data[i].start);
@@ -371,11 +396,12 @@ double method4(const char *filename, int num_threads) {
 
     // Aggregate results
     double total_sum = 0.0;
+    *total_numbers = 0;
 
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
-
         total_sum += thread_data[i].sum;
+        *total_numbers += thread_data[i].count; // Accumulate total count of numbers
     }
 
     munmap(mapped_file, file_size);
@@ -434,7 +460,7 @@ size_t count_lines(const char *filename) {
 }
 
 // Function pointer type for methods
-typedef double (*SumMethod)(const char *, int);
+typedef double (*SumMethod)(const char *, int, int *);
 
 int main(int argc, char *argv[]) {
     if (argc < 4 || argc > 5) {
@@ -457,7 +483,7 @@ int main(int argc, char *argv[]) {
     }
 
     // First count the number of lines in the file
-    size_t total_num = count_lines(argv[1]);
+    // size_t total_num = count_lines(argv[1]);
 
     // Check if verbose is requested
     // int verbose = (argc == 5 && strcmp(argv[4], "-v") == 0);
@@ -486,8 +512,10 @@ int main(int argc, char *argv[]) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
+    int total_numbers;
+
     // Execute the selected method
-    double total_sum = selected_method(argv[1], num_threads);
+    double total_sum = selected_method(argv[1], num_threads, &total_numbers);
     double elapsed_time = 0.0;
 
     // End timing
@@ -507,10 +535,10 @@ int main(int argc, char *argv[]) {
     //     }
     // }
 
-    printf("El programa ejecuta %d threads y la suma total de %zu números es %lf "
+    printf("El programa ejecuta %d threads y la suma total de %i números es %lf "
            "en tiempo %lf (s)\n",
-           num_threads, total_num, total_sum, elapsed_time);
-    printf("Total Sum: %lf\n", total_sum);
+           num_threads, total_numbers, total_sum, elapsed_time);
+    // printf("Total Sum: %lf, numbers %i\n", total_sum, total_numbers);
 
     return 0;
 }
