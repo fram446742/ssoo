@@ -1,0 +1,7 @@
+# Ejecutar el primer proceso cada minuto
+* * * * * /home/franc/ssoo/p1_cron 1>> /home/franc/ssoo/primer_proceso.log 2>> /home/franc/ssoo/primer_proceso_error.log
+
+# Ejecutar el segundo proceso cada minuto
+* * * * * /home/franc/ssoo/p2_cron 1>> /home/franc/ssoo/segundo_proceso.log 2>> /home/franc/ssoo/segundo_proceso_error.log
+
+
